@@ -75,28 +75,28 @@ jobs:
           set -euo pipefail
           BUNDLE="src-tauri/target/x86_64-unknown-linux-gnu/release/bundle"
 
-          # AppImage updater artifact: Tauri v2 produce .AppImage.tar.gz + .sig
-          APPIMAGE_TARGZ=$(find "$BUNDLE/appimage" -maxdepth 1 -name '*.AppImage.tar.gz' | head -1 || true)
-          APPIMAGE_SIG="${APPIMAGE_TARGZ}.sig"
-
-          # AppImage para descarga manual (el binario suelto)
-          APPIMAGE=$(find "$BUNDLE/appimage" -maxdepth 1 -name '*.AppImage' ! -name '*.AppImage.tar.gz' ! -name '*.sig' | head -1 || true)
-
-          # .deb para distros Debian/Ubuntu
-          DEB=$(find "$BUNDLE/deb" -maxdepth 1 -name '*.deb' | head -1 || true)
-
-          if [[ -z "$APPIMAGE_TARGZ" ]] || [[ ! -f "$APPIMAGE_SIG" ]]; then
-            echo "❌ No encontré $APPIMAGE_TARGZ o su .sig" >&2
-            echo "Contenido del bundle:" >&2
+          # Tauri v2 firma el .AppImage directamente (igual que el .exe en
+          # Windows). El .AppImage es a la vez el updater artifact y el
+          # binario para descarga manual.
+          APPIMAGE=$(find "$BUNDLE/appimage" -maxdepth 1 -name '*.AppImage' ! -name '*.sig' | head -1 || true)
+          if [[ -z "$APPIMAGE" ]]; then
+            echo "❌ No encontré .AppImage en $BUNDLE/appimage" >&2
             find "$BUNDLE" -maxdepth 3 -type f >&2 || true
             exit 1
           fi
+          APPIMAGE_SIG="${APPIMAGE}.sig"
+          if [[ ! -f "$APPIMAGE_SIG" ]]; then
+            echo "❌ No encontré $APPIMAGE_SIG — ¿build sin firma?" >&2
+            exit 1
+          fi
+
+          # .deb para distros Debian/Ubuntu (instalador manual, no updater).
+          DEB=$(find "$BUNDLE/deb" -maxdepth 1 -name '*.deb' | head -1 || true)
 
           {
-            echo "appimage_targz=$APPIMAGE_TARGZ"
-            echo "appimage_targz_name=$(basename "$APPIMAGE_TARGZ")"
-            echo "appimage_sig=$APPIMAGE_SIG"
             echo "appimage=$APPIMAGE"
+            echo "appimage_name=$(basename "$APPIMAGE")"
+            echo "appimage_sig=$APPIMAGE_SIG"
             echo "deb=$DEB"
           } >> "$GITHUB_OUTPUT"
 
@@ -108,11 +108,8 @@ jobs:
           set -euo pipefail
           TAG="${{ inputs.tag }}"
           REPO="${{ github.repository }}"
-          gh release upload "$TAG" "${{ steps.art.outputs.appimage_targz }}" --repo "$REPO" --clobber
+          gh release upload "$TAG" "${{ steps.art.outputs.appimage }}" --repo "$REPO" --clobber
           gh release upload "$TAG" "${{ steps.art.outputs.appimage_sig }}" --repo "$REPO" --clobber
-          if [[ -n "${{ steps.art.outputs.appimage }}" ]]; then
-            gh release upload "$TAG" "${{ steps.art.outputs.appimage }}" --repo "$REPO" --clobber
-          fi
           if [[ -n "${{ steps.art.outputs.deb }}" ]]; then
             gh release upload "$TAG" "${{ steps.art.outputs.deb }}" --repo "$REPO" --clobber
           fi
@@ -126,7 +123,7 @@ jobs:
           TAG="${{ inputs.tag }}"
           REPO="${{ github.repository }}"
           VERSION="${TAG#v}"
-          APPIMAGE_NAME="${{ steps.art.outputs.appimage_targz_name }}"
+          APPIMAGE_NAME="${{ steps.art.outputs.appimage_name }}"
           SIG=$(cat "${{ steps.art.outputs.appimage_sig }}")
           SIG="${SIG//$'\n'/}"
 
