@@ -68,6 +68,11 @@ jobs:
       - name: Tauri build (.deb solamente)
         env:
           ARKA_LICENSE_SECRET: ${{ secrets.ARKA_LICENSE_SECRET }}
+          # Tauri exige la privada porque tauri.conf.json declara la pubkey
+          # del updater. Igualmente firma el .deb (no usamos el .sig en
+          # latest.json — el .deb queda solo para descarga manual).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri -- build --target x86_64-unknown-linux-gnu --bundles deb
 
       - name: Locate .deb artifact
