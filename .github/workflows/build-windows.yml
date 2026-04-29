@@ -1,0 +1,138 @@
+name: Build Windows
+
+# Trigger manual desde:
+#   gh workflow run build-windows.yml -f tag=v1.2.7 --repo kevynperez/arka-releases
+# o desde la UI (Actions → Build Windows → Run workflow).
+#
+# Builda Arka para Windows x86_64 a partir del tag indicado del repo
+# privado kevynperez/Arka, firma el binario con la llave del updater, y
+# mergea las entries en el release ya existente en este repo público.
+#
+# Asume que el tag ya existe en kevynperez/Arka y que el flujo Mac
+# (`bash scripts/ship.sh && npm run release:gh`) ya creó el release y
+# subió los artefactos darwin a este repo. Este workflow solo agrega
+# las entries de Windows.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag a buildear (ej. v1.2.7) — debe existir ya en kevynperez/Arka"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Tauri build (windows-x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout private Arka source at tag
+        uses: actions/checkout@v4
+        with:
+          repository: kevynperez/Arka
+          token: ${{ secrets.ARKA_PRIVATE_REPO_PAT }}
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install node deps
+        run: npm ci
+
+      - name: Tauri build (firmado)
+        env:
+          ARKA_LICENSE_SECRET: ${{ secrets.ARKA_LICENSE_SECRET }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri -- build --target x86_64-pc-windows-msvc
+
+      - name: Locate artifacts
+        id: art
+        shell: pwsh
+        run: |
+          $bundle = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
+          $nsisZip = Get-ChildItem -Path "$bundle/nsis" -Filter "*.nsis.zip" -Recurse | Select-Object -First 1
+          if (-not $nsisZip) { throw "No encontré .nsis.zip en $bundle/nsis" }
+          $sig = "$($nsisZip.FullName).sig"
+          if (-not (Test-Path $sig)) { throw "No encontré .sig junto al .nsis.zip — ¿build sin firma?" }
+          $exe = Get-ChildItem -Path "$bundle/nsis" -Filter "*-setup.exe" -Recurse | Select-Object -First 1
+
+          "nsis_zip=$($nsisZip.FullName)"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "nsis_zip_name=$($nsisZip.Name)"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "nsis_sig=$sig"                   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "exe=$($exe.FullName)"            | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload Windows assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag }}"
+          $repo = "${{ github.repository }}"
+          gh release upload $tag "${{ steps.art.outputs.nsis_zip }}" --repo $repo --clobber
+          gh release upload $tag "${{ steps.art.outputs.nsis_sig }}" --repo $repo --clobber
+          if (Test-Path "${{ steps.art.outputs.exe }}") {
+            gh release upload $tag "${{ steps.art.outputs.exe }}" --repo $repo --clobber
+          }
+
+      - name: Merge windows entry into latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag }}"
+          $repo = "${{ github.repository }}"
+          $version = $tag.TrimStart("v")
+          $nsisZipName = "${{ steps.art.outputs.nsis_zip_name }}"
+          $sig = (Get-Content "${{ steps.art.outputs.nsis_sig }}" -Raw).Trim()
+
+          $manifestDir = Join-Path $env:RUNNER_TEMP "manifest"
+          New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
+          $existingPath = Join-Path $manifestDir "latest.json"
+
+          $manifest = $null
+          try {
+            gh release download $tag --repo $repo --pattern "latest.json" --dir $manifestDir --clobber
+            $manifest = Get-Content $existingPath -Raw | ConvertFrom-Json
+          } catch {
+            Write-Host "No latest.json existente → genero uno nuevo"
+          }
+
+          if ($null -eq $manifest -or $manifest.version -ne $version) {
+            $manifest = [pscustomobject]@{
+              version  = $version
+              notes    = "Arka $tag"
+              pub_date = (Get-Date).ToUniversalTime().ToString("o")
+              platforms = [pscustomobject]@{}
+            }
+          }
+
+          # Mergear preservando entries previas
+          $platforms = @{}
+          if ($manifest.platforms) {
+            foreach ($p in $manifest.platforms.PSObject.Properties) {
+              $platforms[$p.Name] = $p.Value
+            }
+          }
+          $platforms["windows-x86_64"] = [pscustomobject]@{
+            url       = "https://github.com/$repo/releases/download/$tag/$nsisZipName"
+            signature = $sig
+          }
+          $manifest.platforms = $platforms
+
+          $merged = $manifest | ConvertTo-Json -Depth 10
+          Set-Content -Path $existingPath -Value $merged -NoNewline -Encoding utf8
+          gh release upload $tag $existingPath --repo $repo --clobber
+          Write-Host "✅ latest.json actualizado con windows-x86_64"
