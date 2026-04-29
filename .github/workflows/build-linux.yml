@@ -2,13 +2,17 @@ name: Build Linux
 
 # Trigger manual desde:
 #   gh workflow run build-linux.yml -f tag=v1.2.7 --repo kevynperez/arka-releases
-# o desde la UI (Actions → Build Linux → Run workflow).
 #
-# Builda Arka para Linux x86_64 (.AppImage) a partir del tag indicado del repo
-# privado kevynperez/Arka, firma el AppImage con la llave del updater, y
-# mergea la entry linux-x86_64 en el release de este repo.
+# Builda Arka para Linux x86_64 SOLO en formato `.deb` (Debian/Ubuntu).
+# El AppImage está deshabilitado a propósito: pesaba ~78 MB porque empaca
+# WebKitGTK + GTK + libsoup completos. El `.deb` pesa ~10 MB porque declara
+# `libwebkit2gtk-4.1-0` como dependencia y `apt` la resuelve del sistema.
 #
-# Asume que el tag ya existe en kevynperez/Arka.
+# Trade-off: los clientes Linux instalan manualmente con `sudo dpkg -i ...`
+# o `sudo apt install ./arka.deb` y NO reciben auto-update. Para auto-update
+# tendrían que usar el AppImage; cuando aparezca un cliente que lo justifique,
+# reactivar la opción agregando `appimage,updater` a `--bundles` y descomentar
+# el merge de `latest.json`.
 on:
   workflow_dispatch:
     inputs:
@@ -22,7 +26,7 @@ permissions:
 
 jobs:
   build:
-    name: Tauri build (linux-x86_64)
+    name: Tauri build (linux-x86_64, .deb only)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout private Arka source at tag
@@ -61,46 +65,27 @@ jobs:
       - name: Install node deps
         run: npm ci
 
-      - name: Tauri build (firmado)
+      - name: Tauri build (.deb solamente)
         env:
           ARKA_LICENSE_SECRET: ${{ secrets.ARKA_LICENSE_SECRET }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri -- build --target x86_64-unknown-linux-gnu --bundles appimage,deb,updater
+        run: npm run tauri -- build --target x86_64-unknown-linux-gnu --bundles deb
 
-      - name: Locate artifacts
+      - name: Locate .deb artifact
         id: art
         shell: bash
         run: |
           set -euo pipefail
           BUNDLE="src-tauri/target/x86_64-unknown-linux-gnu/release/bundle"
-
-          # Tauri v2 firma el .AppImage directamente (igual que el .exe en
-          # Windows). El .AppImage es a la vez el updater artifact y el
-          # binario para descarga manual.
-          APPIMAGE=$(find "$BUNDLE/appimage" -maxdepth 1 -name '*.AppImage' ! -name '*.sig' | head -1 || true)
-          if [[ -z "$APPIMAGE" ]]; then
-            echo "❌ No encontré .AppImage en $BUNDLE/appimage" >&2
+          DEB=$(find "$BUNDLE/deb" -maxdepth 1 -name '*.deb' | head -1 || true)
+          if [[ -z "$DEB" ]] || [[ ! -f "$DEB" ]]; then
+            echo "❌ No encontré .deb en $BUNDLE/deb" >&2
             find "$BUNDLE" -maxdepth 3 -type f >&2 || true
             exit 1
           fi
-          APPIMAGE_SIG="${APPIMAGE}.sig"
-          if [[ ! -f "$APPIMAGE_SIG" ]]; then
-            echo "❌ No encontré $APPIMAGE_SIG — ¿build sin firma?" >&2
-            exit 1
-          fi
+          echo "deb=$DEB" >> "$GITHUB_OUTPUT"
+          echo "deb_name=$(basename "$DEB")" >> "$GITHUB_OUTPUT"
 
-          # .deb para distros Debian/Ubuntu (instalador manual, no updater).
-          DEB=$(find "$BUNDLE/deb" -maxdepth 1 -name '*.deb' | head -1 || true)
-
-          {
-            echo "appimage=$APPIMAGE"
-            echo "appimage_name=$(basename "$APPIMAGE")"
-            echo "appimage_sig=$APPIMAGE_SIG"
-            echo "deb=$DEB"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Upload Linux assets to release
+      - name: Upload .deb to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -108,40 +93,8 @@ jobs:
           set -euo pipefail
           TAG="${{ inputs.tag }}"
           REPO="${{ github.repository }}"
-          gh release upload "$TAG" "${{ steps.art.outputs.appimage }}" --repo "$REPO" --clobber
-          gh release upload "$TAG" "${{ steps.art.outputs.appimage_sig }}" --repo "$REPO" --clobber
-          if [[ -n "${{ steps.art.outputs.deb }}" ]]; then
-            gh release upload "$TAG" "${{ steps.art.outputs.deb }}" --repo "$REPO" --clobber
-          fi
-
-      - name: Merge linux entry into latest.json
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAG="${{ inputs.tag }}"
-          REPO="${{ github.repository }}"
-          VERSION="${TAG#v}"
-          APPIMAGE_NAME="${{ steps.art.outputs.appimage_name }}"
-          SIG=$(cat "${{ steps.art.outputs.appimage_sig }}")
-          SIG="${SIG//$'\n'/}"
-
-          MANIFEST_DIR="$RUNNER_TEMP/manifest"
-          mkdir -p "$MANIFEST_DIR"
-          MANIFEST_PATH="$MANIFEST_DIR/latest.json"
-
-          if gh release download "$TAG" --repo "$REPO" --pattern "latest.json" --dir "$MANIFEST_DIR" --clobber 2>/dev/null; then
-            EXISTING=$(cat "$MANIFEST_PATH")
-          else
-            EXISTING="{\"version\":\"$VERSION\",\"notes\":\"Arka $TAG\",\"pub_date\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"platforms\":{}}"
-          fi
-
-          # Merge la entry linux-x86_64 preservando el resto
-          URL="https://github.com/$REPO/releases/download/$TAG/$APPIMAGE_NAME"
-          MERGED=$(echo "$EXISTING" | jq --arg url "$URL" --arg sig "$SIG" \
-            '.platforms["linux-x86_64"] = {url: $url, signature: $sig}')
-
-          echo "$MERGED" > "$MANIFEST_PATH"
-          gh release upload "$TAG" "$MANIFEST_PATH" --repo "$REPO" --clobber
-          echo "✅ latest.json actualizado con linux-x86_64"
+          gh release upload "$TAG" "${{ steps.art.outputs.deb }}" --repo "$REPO" --clobber
+          echo "✅ ${{ steps.art.outputs.deb_name }} subido al release $TAG"
+          echo "ℹ️  No se merge entry en latest.json: el .deb no soporta auto-update."
+          echo "    Los clientes Linux instalan manualmente con:"
+          echo "      sudo apt install ./${{ steps.art.outputs.deb_name }}"
