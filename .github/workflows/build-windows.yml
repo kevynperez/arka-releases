@@ -5,13 +5,11 @@ name: Build Windows
 # o desde la UI (Actions → Build Windows → Run workflow).
 #
 # Builda Arka para Windows x86_64 a partir del tag indicado del repo
-# privado kevynperez/Arka, firma el binario con la llave del updater, y
-# mergea las entries en el release ya existente en este repo público.
+# privado kevynperez/Arka, firma el .exe con la llave del updater, y
+# mergea la entry windows-x86_64 en el release ya existente en este repo.
 #
 # Asume que el tag ya existe en kevynperez/Arka y que el flujo Mac
-# (`bash scripts/ship.sh && npm run release:gh`) ya creó el release y
-# subió los artefactos darwin a este repo. Este workflow solo agrega
-# las entries de Windows.
+# (`bash scripts/ship.sh && npm run release:gh`) ya creó el release.
 on:
   workflow_dispatch:
     inputs:
@@ -62,17 +60,22 @@ jobs:
         id: art
         shell: pwsh
         run: |
+          # Tauri v2 en Windows: con createUpdaterArtifacts:true firma el
+          # .exe (NSIS) y el .msi directamente — no genera .nsis.zip.
+          # Preferimos el .exe NSIS que es el flujo que usan los clientes.
           $bundle = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
-          $nsisZip = Get-ChildItem -Path "$bundle/nsis" -Filter "*.nsis.zip" -Recurse | Select-Object -First 1
-          if (-not $nsisZip) { throw "No encontré .nsis.zip en $bundle/nsis" }
-          $sig = "$($nsisZip.FullName).sig"
-          if (-not (Test-Path $sig)) { throw "No encontré .sig junto al .nsis.zip — ¿build sin firma?" }
           $exe = Get-ChildItem -Path "$bundle/nsis" -Filter "*-setup.exe" -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "No encontré *-setup.exe en $bundle/nsis" }
+          $sig = "$($exe.FullName).sig"
+          if (-not (Test-Path $sig)) { throw "No encontré $sig — ¿build sin firma?" }
+          $msi = Get-ChildItem -Path "$bundle/msi" -Filter "*.msi" -Recurse | Select-Object -First 1
 
-          "nsis_zip=$($nsisZip.FullName)"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "nsis_zip_name=$($nsisZip.Name)"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "nsis_sig=$sig"                   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "exe=$($exe.FullName)"            | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "exe=$($exe.FullName)"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "exe_name=$($exe.Name)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "exe_sig=$sig"              | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ($msi) {
+            "msi=$($msi.FullName)"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
 
       - name: Upload Windows assets to release
         env:
@@ -81,10 +84,10 @@ jobs:
         run: |
           $tag = "${{ inputs.tag }}"
           $repo = "${{ github.repository }}"
-          gh release upload $tag "${{ steps.art.outputs.nsis_zip }}" --repo $repo --clobber
-          gh release upload $tag "${{ steps.art.outputs.nsis_sig }}" --repo $repo --clobber
-          if (Test-Path "${{ steps.art.outputs.exe }}") {
-            gh release upload $tag "${{ steps.art.outputs.exe }}" --repo $repo --clobber
+          gh release upload $tag "${{ steps.art.outputs.exe }}" --repo $repo --clobber
+          gh release upload $tag "${{ steps.art.outputs.exe_sig }}" --repo $repo --clobber
+          if ("${{ steps.art.outputs.msi }}" -ne "") {
+            gh release upload $tag "${{ steps.art.outputs.msi }}" --repo $repo --clobber
           }
 
       - name: Merge windows entry into latest.json
@@ -95,8 +98,8 @@ jobs:
           $tag = "${{ inputs.tag }}"
           $repo = "${{ github.repository }}"
           $version = $tag.TrimStart("v")
-          $nsisZipName = "${{ steps.art.outputs.nsis_zip_name }}"
-          $sig = (Get-Content "${{ steps.art.outputs.nsis_sig }}" -Raw).Trim()
+          $exeName = "${{ steps.art.outputs.exe_name }}"
+          $sig = (Get-Content "${{ steps.art.outputs.exe_sig }}" -Raw).Trim()
 
           $manifestDir = Join-Path $env:RUNNER_TEMP "manifest"
           New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
@@ -119,7 +122,6 @@ jobs:
             }
           }
 
-          # Mergear preservando entries previas
           $platforms = @{}
           if ($manifest.platforms) {
             foreach ($p in $manifest.platforms.PSObject.Properties) {
@@ -127,7 +129,7 @@ jobs:
             }
           }
           $platforms["windows-x86_64"] = [pscustomobject]@{
-            url       = "https://github.com/$repo/releases/download/$tag/$nsisZipName"
+            url       = "https://github.com/$repo/releases/download/$tag/$exeName"
             signature = $sig
           }
           $manifest.platforms = $platforms
